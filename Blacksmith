@@ -1,0 +1,191 @@
+#include "stm32f1xx_hal.h"
+#include "app_config.h"
+#include "ssd1306.h"
+#include "lcd1602_i2c.h"
+#include "main.h"
+
+/* ---------- 简单按键读取（无去抖） ---------- */
+static uint8_t key_down(GPIO_TypeDef* port, uint16_t pin)
+{
+    return (HAL_GPIO_ReadPin(port, pin) == GPIO_PIN_RESET);
+}
+
+#define NOTE_MAX 16
+typedef struct{
+    uint8_t lane;   // 0..3
+    uint16_t tms;   // 判定时间(ms)
+    uint8_t hit;    // 0/1
+} Note;
+
+static Note note[NOTE_MAX];
+static uint32_t start_ms;
+static uint16_t score=0;
+static uint8_t miss=0;
+
+#define FALL_TIME 1600
+#define HIT_Y 52
+
+static uint8_t lane_center(uint8_t lane){ return (uint8_t)(16 + lane*32); }
+
+static void hud(void)
+{
+    char l1[17]="Score:0000      ";
+    char l2[17]="Miss:00         ";
+    l1[6]=(char)('0'+(score/1000)%10);
+    l1[7]=(char)('0'+(score/100)%10);
+    l1[8]=(char)('0'+(score/10)%10);
+    l1[9]=(char)('0'+(score)%10);
+    l2[5]=(char)('0'+(miss/10));
+    l2[6]=(char)('0'+(miss%10));
+    lcd_goto(0,0); lcd_print(l1);
+    lcd_goto(1,0); lcd_print(l2);
+}
+
+static char quality(void)
+{
+    if(miss<=1) return 'A';
+    if(miss<=4) return 'B';
+    if(miss<=8) return 'C';
+    return 'D';
+}
+
+static void start_game(void)
+{
+    score=0; miss=0;
+    start_ms = HAL_GetTick();
+
+    for(uint8_t i=0;i<NOTE_MAX;i++){
+        note[i].lane = (uint8_t)((start_ms + i*17) % 4);
+        note[i].tms  = (uint16_t)(800 + i*350);
+        note[i].hit  = 0;
+    }
+
+    lcd_clear();
+    hud();
+}
+
+static void try_hit(uint8_t lane)
+{
+    uint32_t t = HAL_GetTick() - start_ms;
+
+    for(uint8_t i=0;i<NOTE_MAX;i++){
+        if(note[i].hit) continue;
+        if(note[i].lane != lane) continue;
+
+        int32_t dt = (int32_t)t - (int32_t)note[i].tms;
+        if(dt<0) dt = -dt;
+
+        if(dt <= 140){
+            note[i].hit = 1;
+            score += 100;
+            hud();
+            return;
+        }
+    }
+
+    miss++;
+    hud();
+}
+
+static void render(void)
+{
+    uint32_t t = HAL_GetTick() - start_ms;
+
+    oled_clear();
+
+    /* 轨道竖线 */
+    for(uint8_t y=0;y<64;y++){
+        oled_set_pixel(32,y,1);
+        oled_set_pixel(64,y,1);
+        oled_set_pixel(96,y,1);
+    }
+
+    /* 判定线 */
+    for(uint8_t x=0;x<128;x+=2) oled_set_pixel(x, HIT_Y, 1);
+
+    /* 音符下落 */
+    for(uint8_t i=0;i<NOTE_MAX;i++){
+        if(note[i].hit) continue;
+
+        if(t + FALL_TIME < note[i].tms) continue;
+        if(t > (uint32_t)note[i].tms + 250) continue;
+
+        int32_t dt = (int32_t)t - ((int32_t)note[i].tms - (int32_t)FALL_TIME);
+        int32_t y  = (dt * HIT_Y) / FALL_TIME;
+        if(y<0) y=0; if(y>63) y=63;
+
+        uint8_t cx = lane_center(note[i].lane);
+        oled_draw_rect((uint8_t)(cx-3), (uint8_t)y, 6, 4, 1);
+    }
+
+    oled_update();
+}
+
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_I2C1_Init(void);
+
+int main(void)
+{
+    HAL_Init();
+    SystemClock_Config();
+    MX_GPIO_Init();
+    MX_I2C1_Init();
+
+    oled_init();
+    lcd_init();
+
+    start_game();
+
+    while(1)
+    {
+        uint32_t t = HAL_GetTick() - start_ms;
+
+        /* 直接按键判定（无去抖） */
+        if(key_down(KEY_LEFT_GPIO_Port, KEY_LEFT_Pin)){
+            try_hit(0);
+            HAL_Delay(150);
+        }
+        if(key_down(KEY_UP_GPIO_Port, KEY_UP_Pin)){
+            try_hit(1);
+            HAL_Delay(150);
+        }
+        if(key_down(KEY_DOWN_GPIO_Port, KEY_DOWN_Pin)){
+            try_hit(2);
+            HAL_Delay(150);
+        }
+        if(key_down(KEY_RIGHT_GPIO_Port, KEY_RIGHT_Pin)){
+            try_hit(3);
+            HAL_Delay(150);
+        }
+
+        /* 超过判定窗口没打中 -> miss */
+        for(uint8_t i=0;i<NOTE_MAX;i++){
+            if(note[i].hit) continue;
+            if(t > (uint32_t)note[i].tms + 250){
+                note[i].hit = 1;
+                miss++;
+                hud();
+            }
+        }
+
+        /* 结束 */
+        {
+            uint8_t done = 1;
+            for(uint8_t i=0;i<NOTE_MAX;i++){
+                if(!note[i].hit){ done=0; break; }
+            }
+            if(done){
+                char q = quality();
+                lcd_clear();
+                lcd_goto(0,0); lcd_print("Done! Quality:");
+                lcd_putc(q);
+                lcd_goto(1,0); lcd_print("Reset to replay");
+                while(1){ render(); HAL_Delay(50); } // 初学者做法：停住
+            }
+        }
+
+        render();
+        HAL_Delay(30);
+    }
+}
