@@ -1,0 +1,205 @@
+#include "stm32f1xx_hal.h"
+#include "app_config.h"
+#include "ssd1306.h"
+#include "lcd1602_i2c.h"
+#include "main.h"
+
+/* ---------- 简单按键读取（无去抖） ---------- */
+static uint8_t key_down(GPIO_TypeDef* port, uint16_t pin)
+{
+    return (HAL_GPIO_ReadPin(port, pin) == GPIO_PIN_RESET); // 低电平按下
+}
+
+/* ---------- 游戏资源 ---------- */
+#define MAP_W 32
+#define MAP_H 16
+enum { T_G=0, T_R=1, T_W=2, T_H=3 };
+
+static const uint8_t TILE[4][8] = {
+    {0,0,0,0,0,0,0,0},
+    {0x00,0x3C,0x7E,0xE7,0xC3,0x7E,0x3C,0},
+    {0x00,0x66,0xCC,0x66,0xCC,0x66,0xCC,0},
+    {0x18,0x3C,0x7E,0xDB,0xFF,0x24,0x24,0}
+};
+
+static const uint8_t MAP0[MAP_H][MAP_W] = {
+    {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+    {0,0,0,0,0,0,0,0,0,2,2,2,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,0,0,0,0,0},
+    {0,0,0,0,0,0,0,0,0,2,0,2,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0},
+    {0,0,0,0,0,1,1,0,0,2,2,2,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0},
+    {0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0},
+    {0,0,0,0,0,1,0,0,0,0,0,0,0,0,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,2,2,0},
+    {0,0,0,0,0,1,0,0,0,0,0,0,0,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,2,0,0},
+    {0,0,0,0,0,1,1,1,0,0,0,0,0,0,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,2,2,0},
+    {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+    {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,0,0,0,0,0,0},
+    {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0},
+    {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0},
+    {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,0,0,0,0,0},
+    {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+    {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,3},
+    {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0}
+};
+
+static const uint8_t SPR_PLAYER[8] = {0x18,0x3C,0x7E,0x5A,0x7E,0x3C,0x24,0x00};
+static const uint8_t SPR_SLIME [8] = {0x00,0x3C,0x7E,0xDB,0xFF,0x66,0x24,0x00};
+
+#define SLN 3
+static uint8_t sx[SLN] = {10,18,26};
+static uint8_t sy[SLN] = {3, 7,10};
+static uint8_t alive[SLN];
+
+static uint8_t px=1, py=1, hp=3;
+static uint16_t timer_s = 60;
+static uint32_t last_sec = 0;
+
+static uint8_t tile(uint8_t x, uint8_t y){ if(x>=MAP_W||y>=MAP_H) return 0; return MAP0[y][x]; }
+static uint8_t block(uint8_t t){ return (t==T_R || t==T_W); }
+
+static void hud(void)
+{
+    char l1[17] = "HP:***  T:00   ";
+    char l2[17] = "A:Act          ";
+    l1[3]=(hp>=1)?'*':' '; l1[4]=(hp>=2)?'*':' '; l1[5]=(hp>=3)?'*':' ';
+    l1[11]=(char)('0'+(timer_s/10));
+    l1[12]=(char)('0'+(timer_s%10));
+    lcd_goto(0,0); lcd_print(l1);
+    lcd_goto(1,0); lcd_print(l2);
+}
+
+static void reset_exhaust(void)
+{
+    px=1; py=1; hp=3; timer_s=60;
+    last_sec = HAL_GetTick();
+    for(uint8_t i=0;i<SLN;i++) alive[i]=1;
+
+    lcd_clear();
+    lcd_goto(0,0); lcd_print("Exhausted!");
+    lcd_goto(1,0); lcd_print("Restart...");
+    HAL_Delay(600);
+    hud();
+}
+
+static void interact(void)
+{
+    for(uint8_t i=0;i<SLN;i++){
+        if(!alive[i]) continue;
+        uint8_t dx=(px>sx[i])?(px-sx[i]):(sx[i]-px);
+        uint8_t dy=(py>sy[i])?(py-sy[i]):(sy[i]-py);
+        if(dx+dy<=1){
+            alive[i]=0;
+            if(((HAL_GetTick()>>3)&1) && hp>0) hp--; // 简单随机受伤
+            if(timer_s>3) timer_s -= 3;
+            hud();
+            return;
+        }
+    }
+}
+
+static void render(void)
+{
+    uint8_t camx = (px>8)?(px-8):0;
+    uint8_t camy = (py>4)?(py-4):0;
+    if(camx > MAP_W-16) camx = MAP_W-16;
+    if(camy > MAP_H-8)  camy = MAP_H-8;
+
+    oled_clear();
+
+    for(uint8_t ty=0; ty<8; ty++){
+        for(uint8_t tx=0; tx<16; tx++){
+            uint8_t t = tile(camx+tx, camy+ty);
+            oled_draw_bitmap8x8(tx*8, ty*8, TILE[t]);
+        }
+    }
+
+    for(uint8_t i=0;i<SLN;i++){
+        if(!alive[i]) continue;
+        if(sx[i]>=camx && sx[i]<camx+16 && sy[i]>=camy && sy[i]<camy+8){
+            oled_draw_bitmap8x8((sx[i]-camx)*8, (sy[i]-camy)*8, SPR_SLIME);
+        }
+    }
+
+    oled_draw_bitmap8x8((px-camx)*8, (py-camy)*8, SPR_PLAYER);
+    oled_update();
+}
+
+/* CubeMX 生成函数 */
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_I2C1_Init(void);
+
+int main(void)
+{
+    HAL_Init();
+    SystemClock_Config();
+    MX_GPIO_Init();
+    MX_I2C1_Init();
+
+    oled_init();
+    lcd_init();
+
+    reset_exhaust();
+
+    while(1)
+    {
+        uint32_t now = HAL_GetTick();
+
+        /* 1秒倒计时 */
+        if(now - last_sec >= 1000){
+            last_sec += 1000;
+            if(timer_s>0) timer_s--;
+            if(timer_s==0) reset_exhaust();
+            hud();
+        }
+
+        /* 直接读按键（无去抖） */
+        if(key_down(KEY_UP_GPIO_Port, KEY_UP_Pin)){
+            if(py>0 && !block(tile(px, py-1))) py--;
+            if(timer_s>0) timer_s--;
+            hud();
+            HAL_Delay(150);
+        }
+        if(key_down(KEY_DOWN_GPIO_Port, KEY_DOWN_Pin)){
+            if(py<MAP_H-1 && !block(tile(px, py+1))) py++;
+            if(timer_s>0) timer_s--;
+            hud();
+            HAL_Delay(150);
+        }
+        if(key_down(KEY_LEFT_GPIO_Port, KEY_LEFT_Pin)){
+            if(px>0 && !block(tile(px-1, py))) px--;
+            if(timer_s>0) timer_s--;
+            hud();
+            HAL_Delay(150);
+        }
+        if(key_down(KEY_RIGHT_GPIO_Port, KEY_RIGHT_Pin)){
+            if(px<MAP_W-1 && !block(tile(px+1, py))) px++;
+            if(timer_s>0) timer_s--;
+            hud();
+            HAL_Delay(150);
+        }
+
+        if(key_down(KEY_A_GPIO_Port, KEY_A_Pin)){
+            interact();
+            if(hp==0){
+                lcd_clear();
+                lcd_goto(0,0); lcd_print("Defeated...");
+                lcd_goto(1,0); lcd_print("Restart...");
+                HAL_Delay(800);
+                reset_exhaust();
+            }
+            HAL_Delay(200); // 防止按住连触发
+        }
+
+        /* 到家提示（站上去就显示） */
+        if(tile(px,py)==T_H){
+            lcd_clear();
+            lcd_goto(0,0); lcd_print("Home! Rest well.");
+            lcd_goto(1,0); lcd_print("Keep exploring!");
+            HAL_Delay(500);
+            hud();
+        }
+
+        render();
+        HAL_Delay(30); // 简单控制帧率
+    }
+}
